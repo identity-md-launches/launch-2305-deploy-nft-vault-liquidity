@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {Deployers} from "v4-core-test/utils/Deployers.sol";
 import {LiquidityAmounts} from "v4-core-test/utils/LiquidityAmounts.sol";
@@ -322,7 +323,11 @@ contract InkSystemTest is Test, Deployers, DeployPermit2 {
 
         InkVault empty = new InkVault(portraits, seats, owner);
         vm.startPrank(owner);
+        vm.expectRevert(InkVault.NotFunded.selector);
         empty.setInk(IERC20(address(ink)));
+        ink.mint(address(empty), 2000 * PORTRAIT);
+        empty.setInk(IERC20(address(ink)));
+        ink.burn(address(empty), 1);
         vm.expectRevert(InkVault.NotFunded.selector);
         empty.setup(root, uint64(block.timestamp), address(liq));
         vm.stopPrank();
@@ -371,28 +376,15 @@ contract InkSystemTest is Test, Deployers, DeployPermit2 {
         assertEq(ink.balanceOf(buyer), PORTRAIT);
     }
 
-    /// Defense in depth: InkLiquidity never lists INK below the price at setPool, even if the price has been
-    /// dragged to the extreme. Shown on a pool without the hook, where swaps are possible before liquidity.
+    /// The floor still holds if price is dragged after opening. The audit fix requires the bound hook.
     function test_liquidityFloorHoldsIfPriceIsDragged() public {
         PoolKey memory k = poolKey;
-        k.hooks = IHooks(address(0));
         int24 openTick = inkIs0 ? -OPEN_TICK : OPEN_TICK;
-        manager.initialize(k, TickMath.getSqrtPriceAtTick(openTick));
-        (int24 lower, int24 upper) = inkIs0 ? (openTick, openTick + RANGE) : (openTick - RANGE, openTick);
         ink.mint(address(this), 2_000_000e18);
-        uint128 l = inkIs0
-            ? LiquidityAmounts.getLiquidityForAmount0(
-                TickMath.getSqrtPriceAtTick(lower), TickMath.getSqrtPriceAtTick(upper), 1_000_000e18
-            )
-            : LiquidityAmounts.getLiquidityForAmount1(
-                TickMath.getSqrtPriceAtTick(lower), TickMath.getSqrtPriceAtTick(upper), 1_000_000e18
-            );
-        modifyLiquidityRouter.modifyLiquidity(
-            k, ModifyLiquidityParams(lower, upper, int256(uint256(l)), bytes32(0)), ""
-        );
         InkLiquidity l2 = new InkLiquidity(manager, posm, owner, treasury);
         vm.prank(owner);
         l2.setPool(k, IERC20(address(ink)));
+        _release();
 
         // A 1-INK sell crosses the empty side for free and drags the price to the extreme.
         ink.approve(address(swapRouter), type(uint256).max);
@@ -657,19 +649,19 @@ contract InkSystemTest is Test, Deployers, DeployPermit2 {
         vault.rerollTraits(10_000, type(uint256).max);
     }
 
-    function test_traitRerollExpiredHashRenews() public {
+    function test_traitRerollExpiredHashClosesWithoutFreeDraw() public {
         _releaseAndTrade();
         _buyInk(buyer, PORTRAIT + PORTRAIT / 100);
         uint256 t = _pullAndReveal(buyer);
         bytes32 oldSeed = portraits.swarmSeed(t);
         _rerollTraits(buyer, t);
         vm.roll(block.number + 300);
-        assertFalse(vault.revealTraits(t), "renewed, not applied");
+        assertFalse(vault.revealTraits(t), "expired, not repainted");
         assertEq(portraits.swarmSeed(t), oldSeed);
-        assertEq(vault.traitRerollBlock(t), block.number);
+        assertEq(vault.traitRerollBlock(t), 0);
         vm.roll(block.number + 2);
-        assertTrue(vault.revealTraits(t));
-        assertTrue(portraits.swarmSeed(t) != oldSeed);
+        vm.expectRevert(InkVault.NoRerollPending.selector);
+        vault.revealTraits(t);
     }
 
     function test_agentDepositReturnsExactlyItsBacking() public {
@@ -968,6 +960,9 @@ contract InkSystemTest is Test, Deployers, DeployPermit2 {
         // Audit b0a5b130: direct safe transfers bypass deposit accounting and must be refused.
         vm.expectRevert(InkVault.UseDeposit.selector);
         vault.onERC721Received(address(0), address(0), 0, "");
+        vm.expectRevert(InkLiquidity.UnexpectedNFT.selector);
+        liq.onERC721Received(address(0), address(0), 0, "");
+        vm.prank(address(posm));
         assertEq(liq.onERC721Received(address(0), address(0), 0, ""), liq.onERC721Received.selector);
 
         // A swap too small to owe any hook fee still goes through, fee-free.
@@ -1007,6 +1002,112 @@ contract InkSystemTest is Test, Deployers, DeployPermit2 {
         second.tickSpacing = 10;
         vm.expectRevert();
         manager.initialize(second, TickMath.getSqrtPriceAtTick(0));
+    }
+
+    /// Imported finding 8ff058a5ba34: an initialized pool is insufficient without the project's hook.
+    function test_setPoolRejectsHooklessPoolAndRemainsCorrectable() public {
+        PoolKey memory wrong = poolKey;
+        wrong.hooks = IHooks(address(0));
+        manager.initialize(wrong, TickMath.getSqrtPriceAtTick(0));
+        InkLiquidity fresh = new InkLiquidity(manager, posm, owner, treasury);
+        vm.startPrank(owner);
+        vm.expectRevert(InkLiquidity.InvalidHook.selector);
+        fresh.setPool(wrong, IERC20(address(ink)));
+        assertFalse(fresh.poolSet());
+        fresh.setPool(poolKey, IERC20(address(ink)));
+        vm.stopPrank();
+        assertTrue(fresh.poolSet());
+    }
+
+    function test_setPoolRejectsInconsistentHookBindings() public {
+        InkLiquidity fresh = new InkLiquidity(manager, posm, owner, treasury);
+        bytes[7] memory reads = [
+            abi.encodeWithSignature("poolCreated()"),
+            abi.encodeWithSignature("poolManager()"),
+            abi.encodeWithSignature("ink()"),
+            abi.encodeWithSignature("imd()"),
+            abi.encodeWithSignature("treasury()"),
+            abi.encodeWithSignature("portraits()"),
+            abi.encodeWithSignature("vault()")
+        ];
+        for (uint256 i; i < reads.length; i++) {
+            // Each dependency check is exercised independently against an otherwise valid, initialized pool.
+            bytes memory bad = i == 0
+                ? abi.encode(false)
+                : i == 5
+                    ? abi.encode(address(seats))
+                    : i == 6 ? abi.encode(address(new InkVault(portraits, seats, owner))) : abi.encode(other);
+            vm.mockCall(address(hook), reads[i], bad);
+            vm.prank(owner);
+            vm.expectRevert(InkLiquidity.InvalidHook.selector);
+            fresh.setPool(poolKey, IERC20(address(ink)));
+            assertFalse(fresh.poolSet());
+            vm.clearMockedCalls();
+        }
+        vm.prank(owner);
+        vault.transferOwnership(other);
+        vm.prank(owner);
+        vm.expectRevert(InkLiquidity.InvalidHook.selector);
+        fresh.setPool(poolKey, IERC20(address(ink)));
+        vm.prank(other);
+        vault.transferOwnership(owner);
+        vm.mockCall(address(portraits), abi.encodeWithSignature("vault()"), abi.encode(other));
+        vm.prank(owner);
+        vm.expectRevert(InkLiquidity.InvalidHook.selector);
+        fresh.setPool(poolKey, IERC20(address(ink)));
+        vm.clearMockedCalls();
+        vm.prank(owner);
+        fresh.setPool(poolKey, IERC20(address(ink)));
+        assertTrue(fresh.poolSet());
+    }
+
+    function test_setPoolRequiresPositionManagerBoundToSameManager() public {
+        InkLiquidity fresh = new InkLiquidity(manager, posm, owner, treasury);
+        vm.mockCall(address(posm), abi.encodeWithSignature("poolManager()"), abi.encode(other));
+        vm.prank(owner);
+        vm.expectRevert(InkLiquidity.InvalidPositionManager.selector);
+        fresh.setPool(poolKey, IERC20(address(ink)));
+        assertFalse(fresh.poolSet());
+        vm.clearMockedCalls();
+        vm.prank(owner);
+        fresh.setPool(poolKey, IERC20(address(ink)));
+    }
+
+    function test_mainnetPoolMustPairWithOfficialIMD() public {
+        InkLiquidity fresh = new InkLiquidity(manager, posm, owner, treasury);
+        uint256 chain = block.chainid;
+        vm.chainId(1);
+        vm.prank(owner);
+        vm.expectRevert(InkLiquidity.InvalidHook.selector);
+        fresh.setPool(poolKey, IERC20(address(ink))); // Local IMD test token is not mainnet IMD.
+        assertFalse(fresh.poolSet());
+        vm.chainId(chain);
+        vm.prank(owner);
+        fresh.setPool(poolKey, IERC20(address(ink)));
+    }
+
+    function test_liquidityCannotRenounceBeforePoolIsConfigured() public {
+        InkLiquidity fresh = new InkLiquidity(manager, posm, owner, treasury);
+        vm.startPrank(owner);
+        vm.expectRevert(InkLiquidity.PoolNotSet.selector);
+        fresh.renounceOwnership();
+        fresh.setPool(poolKey, IERC20(address(ink)));
+        fresh.renounceOwnership();
+        vm.stopPrank();
+        assertEq(fresh.owner(), address(0));
+    }
+
+    function test_liquidityRefusesUnrelatedNFTsButKeepsPositionCustody() public {
+        seats.mint(buyer, 88);
+        vm.prank(buyer);
+        vm.expectRevert(InkLiquidity.UnexpectedNFT.selector);
+        seats.safeTransferFrom(buyer, address(liq), 88);
+        assertEq(seats.ownerOf(88), buyer);
+        _release();
+        assertGt(liq.positionCount(), 0);
+        for (uint256 i; i < liq.positionCount(); i++) {
+            assertEq(IERC721(address(posm)).ownerOf(liq.positions(i)), address(liq));
+        }
     }
 
     // ---------------------------------------------------------------- release premium

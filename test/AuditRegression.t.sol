@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {ConfiguredLiquidity} from "./helpers/ConfiguredLiquidity.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {PoolManager} from "v4-core/PoolManager.sol";
@@ -14,13 +15,18 @@ import {InkPortraits} from "../src/InkPortraits.sol";
 import {InkVault} from "../src/InkVault.sol";
 import {InkLiquidity} from "../src/InkLiquidity.sol";
 import {InkRenderer} from "../src/InkRenderer.sol";
-import {TestSeats} from "../src/testnet/TestSeats.sol";
+import {InkHook, IAgentPortraits, IInkVault} from "../src/InkHook.sol";
+import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
+import {Hooks} from "v4-core/libraries/Hooks.sol";
 
-contract AuditLiquiditySink {
-    function addLiquidity() external pure returns (uint256) {
-        return 0;
+contract PoolManagerView {
+    IPoolManager public immutable poolManager;
+
+    constructor(IPoolManager manager) {
+        poolManager = manager;
     }
 }
+import {TestSeats} from "../src/testnet/TestSeats.sol";
 
 contract AuditRegressionTest is Test {
     uint256 internal constant PORTRAIT = 400_000e18;
@@ -31,7 +37,7 @@ contract AuditRegressionTest is Test {
     InkVault internal vault;
     MockERC20 internal ink;
     TestSeats internal seats;
-    AuditLiquiditySink internal sink;
+    ConfiguredLiquidity internal sink;
 
     function setUp() public {
         vm.roll(100);
@@ -39,7 +45,7 @@ contract AuditRegressionTest is Test {
         portraits = new InkPortraits(owner);
         vault = new InkVault(portraits, seats, owner);
         ink = new MockERC20("INK", "INK", 18);
-        sink = new AuditLiquiditySink();
+        sink = new ConfiguredLiquidity(IERC20(address(ink)));
         ink.mint(address(vault), 2000 * PORTRAIT);
         vm.startPrank(owner);
         portraits.setVault(address(vault));
@@ -117,20 +123,43 @@ contract AuditRegressionTest is Test {
         _mintPortraits(1);
         uint256 before = ink.balanceOf(alice);
         vm.prank(alice);
-        vm.expectRevert(InkVault.UseDeposit.selector);
+        vm.expectRevert(InkPortraits.UseDeposit.selector);
         portraits.safeTransferFrom(alice, address(vault), 10_000);
         assertEq(portraits.ownerOf(10_000), alice);
         assertEq(ink.balanceOf(alice), before);
         assertEq(vault.heldCount(), 0);
     }
 
+    function _poolFixture(PoolManager manager) internal returns (InkLiquidity liquidity, PoolKey memory key) {
+        address treasury = makeAddr("treasury");
+        liquidity = new InkLiquidity(
+            manager, IPositionManager(address(new PoolManagerView(manager))), owner, treasury
+        );
+        address hookAddress = address(
+            uint160(
+                Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                    | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+            ) ^ (0x5555 << 144)
+        );
+        deployCodeTo(
+            "src/InkHook.sol:InkHook",
+            abi.encode(
+                manager,
+                IAgentPortraits(address(portraits)),
+                IInkVault(address(vault)),
+                Currency.wrap(address(0)),
+                treasury,
+                uint16(25)
+            ),
+            hookAddress
+        );
+        key =
+            PoolKey(Currency.wrap(address(0)), Currency.wrap(address(ink)), 12_500, 200, IHooks(hookAddress));
+    }
+
     function test_uninitializedPoolCannotSetPermanentFloor() public {
         PoolManager manager = new PoolManager(owner);
-        InkLiquidity liquidity = new InkLiquidity(
-            manager, IPositionManager(makeAddr("unused position manager")), owner, makeAddr("treasury")
-        );
-        PoolKey memory key =
-            PoolKey(Currency.wrap(address(0)), Currency.wrap(address(ink)), 12_500, 200, IHooks(address(0)));
+        (InkLiquidity liquidity, PoolKey memory key) = _poolFixture(manager);
         vm.prank(owner);
         vm.expectRevert(InkLiquidity.PoolNotInitialized.selector);
         liquidity.setPool(key, IERC20(address(ink)));
@@ -165,11 +194,7 @@ contract AuditRegressionTest is Test {
 
     function test_initializedPoolAtZeroTickIsValid() public {
         PoolManager manager = new PoolManager(owner);
-        InkLiquidity liquidity = new InkLiquidity(
-            manager, IPositionManager(makeAddr("unused position manager")), owner, makeAddr("treasury")
-        );
-        PoolKey memory key =
-            PoolKey(Currency.wrap(address(0)), Currency.wrap(address(ink)), 12_500, 200, IHooks(address(0)));
+        (InkLiquidity liquidity, PoolKey memory key) = _poolFixture(manager);
         manager.initialize(key, TickMath.getSqrtPriceAtTick(0));
         vm.prank(owner);
         liquidity.setPool(key, IERC20(address(ink)));
@@ -209,33 +234,31 @@ contract AuditRegressionTest is Test {
         assertEq(vault.heldCount(), pick < 101 ? 102 : 103);
     }
 
-    function test_hashExpiryDuringAdmissionRenewsAndEventuallyReveals() public {
+    function test_hashExpiryDuringAdmissionKeepsOriginalDraw() public {
         _mintPortraits(201);
         vm.roll(block.number + 1);
         _depositRange(0, 201);
         vm.roll(block.number + 1);
         uint256 first = _pull(buyer, 1);
+        uint256 made = block.number;
         _mature();
+        bytes32 entropy = blockhash(made + 1);
+        uint256 pick = uint256(keccak256(abi.encode(entropy, first))) % 2000;
         assertFalse(vault.reveal(first));
         assertEq(vault.waitingCount(), 101);
         vm.roll(block.number + 300);
-        assertEq(vault.revealNext(1), 0);
-        assertFalse(vault.reveal(first), "expired entropy renews after admission finishes");
-        (, uint64 renewed, bool done) = vault.pulls(first);
-        assertEq(renewed, block.number);
-        assertFalse(done);
+        assertEq(vault.revealNext(1), 0, "second admission batch");
+        assertTrue(vault.reveal(first), "recorded entropy survives expiry");
+        assertFalse(vault.pullExpired(first));
+        assertEq(vault.pullBlock(first), made);
         assertEq(vault.waitingCount(), 0);
-        assertEq(vault.inventorySize(), 201);
-        vm.expectRevert(InkVault.TooEarly.selector);
-        vault.reveal(first);
-        _mature();
-        assertTrue(vault.reveal(first));
+        assertEq(portraits.ownerOf(pick < 201 ? 10_000 + pick : 10_201), buyer);
         assertEq(portraits.balanceOf(buyer), 1);
     }
 
-    /// Review 4ca49345: renewing the head pull must not admit hand-ins made after a queued pull's block into
+    /// Review 4ca49345: expiring the head pull must not admit hand-ins made after a queued pull's block into
     /// that pull's draw, since its block hash is already public.
-    function test_renewedHeadPullNeverWidensALaterPullsDraw() public {
+    function test_expiredHeadPullNeverWidensALaterPullsDraw() public {
         _mintPortraits(2);
         vm.roll(1000);
         uint256 pullA = _pull(alice, 1);
@@ -250,9 +273,10 @@ contract AuditRegressionTest is Test {
         assertEq(blockhash(1001), bytes32(0), "pull A's hash expired");
         assertFalse(vault.reveal(pullA));
         (, uint64 entropyBlock,) = vault.pulls(pullA);
-        assertEq(entropyBlock, 1258, "renewal moves the entropy block");
-        assertEq(vault.pullBlock(pullA), 1000, "renewal keeps the admission cutoff");
-        assertEq(vault.waitingCount(), 2, "renewal admits nothing");
+        assertEq(entropyBlock, 1000, "expiry never replaces entropy");
+        assertTrue(vault.pullExpired(pullA));
+        assertEq(vault.pullBlock(pullA), 1000, "expiry keeps the admission cutoff");
+        assertEq(vault.waitingCount(), 2, "expiry admits nothing");
 
         vm.roll(1260);
         assertTrue(vault.reveal(pullB));
@@ -262,7 +286,7 @@ contract AuditRegressionTest is Test {
         assertEq(vault.pullBlock(pullB), 1003);
         assertEq(vault.waitingCount(), 2, "hand-ins after both pulls' blocks stay out of their draws");
         assertEq(vault.inventorySize(), 0);
-        assertEq(portraits.balanceOf(alice), 1);
+        assertEq(portraits.balanceOf(alice), 0);
         assertEq(portraits.balanceOf(buyer), 1);
 
         // A pull made after the hand-ins admits them, as documented.
@@ -277,9 +301,8 @@ contract AuditRegressionTest is Test {
         vault.pullBlock(pullC + 1);
     }
 
-    /// Review 4ca49345: a renewed pull draws from a later hash over its original candidates; a pull queued
-    /// behind it admits only hand-ins made before its own block, even across repeated renewals.
-    function test_renewalsKeepEachPullsOwnCutoff() public {
+    /// Expiring both pulls keeps later deposits waiting for a genuinely new paid request.
+    function test_expiredPullsCloseWithoutWideningDrawsOrRenewing() public {
         _mintPortraits(1);
         vm.roll(1000);
         uint256 pullA = _pull(buyer, 1);
@@ -288,30 +311,20 @@ contract AuditRegressionTest is Test {
         vm.roll(1010);
         uint256 pullB = _pull(buyer, 1);
         vm.roll(1300);
-        assertEq(vault.revealNext(1), 0, "expired: renewed");
+        assertEq(vault.revealNext(1), 0, "expired, no portrait revealed");
+        assertEq(vault.nextReveal(), pullA + 1);
+        assertTrue(vault.pullExpired(pullA));
         vm.roll(1600);
-        assertEq(vault.revealNext(1), 0, "expired again: renewed again");
-        assertEq(vault.pullBlock(pullA), 1000);
-        (, uint64 entropyBlock, bool done) = vault.pulls(pullA);
-        assertEq(entropyBlock, 1600);
-        assertFalse(done);
-        assertEq(vault.waitingCount(), 1, "the block-1005 hand-in never joins pull A");
-        _mature();
-        assertEq(vault.revealNext(1), 1);
-        assertEq(vault.waitingCount(), 1, "pull A drew without it");
-        assertEq(vault.inventorySize(), 0);
-        assertEq(vault.revealNext(1), 0, "pull B's hash (block 1011) expired too: renewed");
-        assertEq(vault.waitingCount(), 0, "pull B, made at block 1010, admitted it before renewing");
-        assertEq(vault.inventorySize(), 1);
-        assertEq(vault.pullBlock(pullB), 1010);
-        (, entropyBlock, done) = vault.pulls(pullB);
-        assertEq(entropyBlock, block.number);
-        assertFalse(done);
-        _mature();
-        assertEq(vault.revealNext(1), 1);
+        assertEq(vault.revealNext(1), 0);
         assertEq(vault.nextReveal(), pullB + 1);
-        assertEq(portraits.balanceOf(buyer), 2);
-        assertEq(vault.inventorySize() + vault.waitingCount(), vault.heldCount());
+        assertTrue(vault.pullExpired(pullB));
+        assertEq(vault.pullBlock(pullA), 1000);
+        assertEq(vault.pullBlock(pullB), 1010);
+        assertEq(vault.waitingCount(), 1);
+        assertEq(portraits.balanceOf(buyer), 0);
+        assertEq(ink.balanceOf(buyer), 2 * (PORTRAIT - PORTRAIT / 100));
+        vm.expectRevert(InkVault.AlreadyRevealed.selector);
+        vault.reveal(pullA);
     }
 
     /// Review 4ca49345: a pull can't count hand-ins from its own block, since its fixed cutoff never admits
@@ -389,7 +402,7 @@ contract AuditRegressionTest is Test {
     function test_directSafeTransfersRejectedForBothOverloadsAndOtherNFTs() public {
         _mintPortraits(1);
         vm.startPrank(alice);
-        vm.expectRevert(InkVault.UseDeposit.selector);
+        vm.expectRevert(InkPortraits.UseDeposit.selector);
         portraits.safeTransferFrom(alice, address(vault), 10_000, "deposit");
         seats.mint(7);
         vm.expectRevert(InkVault.UseDeposit.selector);
@@ -403,7 +416,7 @@ contract AuditRegressionTest is Test {
         assertEq(vault.heldCount(), 1);
     }
 
-    function test_pendingRerollBlocksApprovedOperatorsAndReportsMetadataThroughRenewal() public {
+    function test_pendingRerollBlocksApprovedOperatorsUntilExpiry() public {
         _mintPortraits(1);
         InkRenderer renderer = new InkRenderer(portraits, owner);
         assertEq(vm.parseJsonUint(renderer.tokenJSON(10_000), ".traitRerollBlock"), 0);
@@ -426,22 +439,18 @@ contract AuditRegressionTest is Test {
         vm.stopPrank();
         vm.roll(block.number + 300);
         assertFalse(vault.revealTraits(10_000));
-        assertEq(vm.parseJsonUint(renderer.tokenJSON(10_000), ".traitRerollBlock"), block.number);
-        assertEq(portraits.swarmSeed(10_000), oldSeed);
-        vm.prank(alice);
-        vm.expectRevert(InkPortraits.RerollPending.selector);
-        portraits.transferFrom(alice, buyer, 10_000);
-        _mature();
-        assertTrue(vault.revealTraits(10_000));
         assertEq(vm.parseJsonUint(renderer.tokenJSON(10_000), ".traitRerollBlock"), 0);
-        assertNotEq(portraits.swarmSeed(10_000), oldSeed);
+        assertEq(portraits.swarmSeed(10_000), oldSeed);
+        _mature();
+        vm.expectRevert(InkVault.NoRerollPending.selector);
+        vault.revealTraits(10_000);
         assertEq(portraits.getApproved(10_000), buyer, "failed transfers do not consume approval");
         vm.prank(buyer);
         portraits.safeTransferFrom(alice, buyer, 10_000);
         assertEq(portraits.ownerOf(10_000), buyer);
     }
 
-    function test_releaseFailureRollsBackUntilLiquidityIsConfigured() public {
+    function test_setupRefusesUnconfiguredLiquidityBeforeCommitting() public {
         PoolManager manager = new PoolManager(owner);
         InkLiquidity liquidity = new InkLiquidity(
             manager, IPositionManager(makeAddr("unused position manager")), owner, makeAddr("treasury")
@@ -452,10 +461,11 @@ contract AuditRegressionTest is Test {
         vm.startPrank(owner);
         p.setVault(address(v));
         v.setInk(IERC20(address(ink)));
+        vm.expectRevert(InkVault.BadSetup.selector);
         v.setup(keccak256("unconfigured liquidity fixture"), uint64(block.timestamp), address(liquidity));
         vm.stopPrank();
-        vm.warp(v.claimEnd());
-        vm.expectRevert(InkLiquidity.PoolNotSet.selector);
+        assertEq(v.statsRoot(), bytes32(0));
+        vm.expectRevert(InkVault.InkNotSet.selector);
         v.release();
         assertFalse(v.released());
         assertEq(ink.balanceOf(address(v)), 2000 * PORTRAIT);

@@ -28,9 +28,8 @@ abstract contract InkSteps is Script {
     address constant IMD = 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7;
     address constant SEATS = 0x0000eC93127BAA929E58E97dd0095A2BFb38ec1D;
     uint256 constant PORTRAIT = 400_000e18;
-    /// The owner's wallet: every IMD fee (the hook's and the released positions' LP fees) and the IMD side of
-    /// the launch's 1% trading fee (through InkFeeRouter) end up here. The contracts themselves are deployed
-    /// and owned by a separate manager wallet.
+    /// IMD fee beneficiary only, including hook/LP fees and the router's IMD receipts.
+    /// Every owner role and royalty beneficiary is the separately supplied launch owner.
     address constant TREASURY = 0xbc10B3662231c830d2ee10bc6359dB17bEa4b3d4;
     /// Released INK starts 16,000 ticks (about 5x) above the opening price, so the unclaimed seats' INK
     /// isn't sold off at IMD's fixed 2,500 IMD opening price.
@@ -51,10 +50,13 @@ abstract contract InkSteps is Script {
     }
 
     /// Checks the contracts launch delivered what was asked: owners, wiring, no stray roles.
-    function checkContractsLaunch(InkPortraits portraits, InkVault vault, InkLiquidity liq, InkRenderer renderer, address owner)
-        public
-        view
-    {
+    function checkContractsLaunch(
+        InkPortraits portraits,
+        InkVault vault,
+        InkLiquidity liq,
+        InkRenderer renderer,
+        address owner
+    ) public view {
         _require(portraits.owner() == owner, "InkPortraits owner");
         _require(vault.owner() == owner, "InkVault owner");
         _require(liq.owner() == owner, "InkLiquidity owner");
@@ -80,17 +82,23 @@ abstract contract InkSteps is Script {
             for (uint256 off; off < art.length; off += chunk) {
                 uint256 end = off + chunk > art.length ? art.length : off + chunk;
                 bytes memory part = new bytes(end - off);
-                for (uint256 i; i < part.length; i++) part[i] = art[off + i];
+                for (uint256 i; i < part.length; i++) {
+                    part[i] = art[off + i];
+                }
                 renderer.addChunk(part);
             }
         }
     }
 
     /// Checks the hook launch: the hook's immutables, the pool, and the vault's 80%.
-    function checkHookLaunch(InkHook hook, InkPortraits portraits, InkVault vault, address treasury, IERC20 ink, PoolKey memory key)
-        public
-        view
-    {
+    function checkHookLaunch(
+        InkHook hook,
+        InkPortraits portraits,
+        InkVault vault,
+        address treasury,
+        IERC20 ink,
+        PoolKey memory key
+    ) public view {
         _require(address(hook.poolManager()) == address(MANAGER), "hook -> PoolManager");
         _require(address(hook.portraits()) == address(portraits), "hook -> portraits");
         _require(address(hook.vault()) == address(vault), "hook -> vault");
@@ -107,9 +115,14 @@ abstract contract InkSteps is Script {
     }
 
     /// Step 4: point the vault and liquidity at INK and schedule the 24-hour window.
-    function stepOpenClaims(InkVault vault, InkLiquidity liq, IERC20 ink, PoolKey memory key, bytes32 root, uint64 start)
-        internal
-    {
+    function stepOpenClaims(
+        InkVault vault,
+        InkLiquidity liq,
+        IERC20 ink,
+        PoolKey memory key,
+        bytes32 root,
+        uint64 start
+    ) internal {
         _require(root != bytes32(0), "snapshot root");
         _require(start >= block.timestamp && start <= block.timestamp + 30 days, "claim start within 30 days");
         vault.setInk(ink);

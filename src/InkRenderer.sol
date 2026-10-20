@@ -51,6 +51,7 @@ contract InkRenderer is IInkRenderer, Ownable {
 
     function addChunk(bytes calldata data) external onlyOwner {
         if (locked) revert IsLocked();
+        if (data.length == 0) revert NoScript();
         if (data.length > MAX_CHUNK) revert ChunkTooLarge();
         // Runtime code = 0x00 (STOP, so the data can never run) + data.
         bytes memory init = abi.encodePacked(hex"600B5981380380925939F3", hex"00", data);
@@ -74,6 +75,11 @@ contract InkRenderer is IInkRenderer, Ownable {
         if (chunks.length == 0) revert NoScript(); // locking with no art would break every token for good
         locked = true;
         emit Locked();
+    }
+
+    function renounceOwnership() public override onlyOwner {
+        if (chunks.length == 0) revert NoScript();
+        super.renounceOwnership();
     }
 
     // ---------------------------------------------------------------- reading

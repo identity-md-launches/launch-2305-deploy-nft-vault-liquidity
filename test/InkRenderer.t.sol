@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {ConfiguredLiquidity} from "./helpers/ConfiguredLiquidity.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
@@ -116,7 +117,7 @@ contract InkRendererTest is Test {
         portraits.setVault(address(vault));
         portraits.setRenderer(address(renderer));
         vault.setInk(IERC20(address(ink)));
-        vault.setup(leaf, uint64(block.timestamp), address(this)); // a one-leaf tree: the root is the leaf; any contract stands in for liquidity, never released
+        vault.setup(leaf, uint64(block.timestamp), address(new ConfiguredLiquidity(IERC20(address(ink))))); // Configured test double; this test never releases.
         renderer.addChunk("const SwarmArt={render(){}};");
         renderer.setPreviewBase("ipfs://previews/");
         vm.stopPrank();
@@ -165,8 +166,10 @@ contract InkRendererTest is Test {
 
     /// Swarm portraits take the unclaimed seats' numbers, lowest first, across all eight bitmap words.
     function test_swarmNumbersFillUnclaimedSeats() public {
+        InkVault vault = new InkVault(portraits, new RendererSeats(), owner);
         vm.prank(owner);
-        portraits.setVault(address(this));
+        portraits.setVault(address(vault));
+        vm.startPrank(address(vault));
         InkPortraits.AgentStats memory s;
         // Claim every seat except 1, 3, 255, 256, 1791, 1792 and 1999.
         for (uint256 seat; seat < 2000; seat++) {
@@ -189,8 +192,10 @@ contract InkRendererTest is Test {
     }
 
     function test_noClaimsAfterTheFirstSwarmPortrait() public {
+        InkVault vault = new InkVault(portraits, new RendererSeats(), owner);
         vm.prank(owner);
-        portraits.setVault(address(this));
+        portraits.setVault(address(vault));
+        vm.startPrank(address(vault));
         InkPortraits.AgentStats memory s;
         portraits.mintAgent(0, address(this), s);
         uint256 id = portraits.mintSwarm(address(this), bytes32(0));

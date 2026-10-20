@@ -6,10 +6,16 @@ This is a portable build input, not a mainnet-ready security certification. Comp
 swarm audit, reviewed fixes, production-router checks and a Sepolia rehearsal first.
 Read source permissions, launch fee policy and all irreversible operations.
 
-No production snapshot, cutoff, wallet credentials, owner address or deployed addresses
+No production snapshot, cutoff, wallet credentials or deployed addresses
 are supplied. `test/fixtures/snapshot-sample.json` is synthetic and MUST NOT be used for
 mainnet setup. Collect and validate the real snapshot privately in the working project.
 The snapshot-fetching pipeline is deliberately not shipped here.
+
+For this Ethereum launch, the owner is `0x824e12b38cff2d3e7ad9607a0212f7f9eb6a06e3`.
+The treasury `0xbc10b3662231c830d2ee10bc6359db17bea4b3d4` receives IMD fees only.
+See [ADAPTATION.md](ADAPTATION.md) for the exact constructors and audit-related changes.
+The factory deploys only InkPortraits, InkVault, InkLiquidity and InkRenderer.
+InkFeeRouter is deployed separately by the owner; TestSeats is testnet-only.
 
 `launch/*.json` are drafts. Replace every REPLACE_WITH value; pin the reviewed public
 repository and immutable 40-character commit using IMD /requests/import. Run the free
@@ -31,13 +37,28 @@ chains, intake addresses and launch policy. Do not assume browser defaults match
    pairs with IMD. Verify fixed 1 billion INK, 10% swarm, 10% initial pool and 80% to the vault.
    Verify the actual request has economics.poolBps 1000 and remainderTo the vault.
    Verify source pinning, hook permissions, token addresses, pool key and trading lock.
-7. Owner calls InkVault.setInk and InkLiquidity.setPool with verified values.
+7. After the vault holds its full 800M INK allocation, the owner calls InkVault.setInk.
+   Set any intended liquidity premium before enabling the pool, then call InkLiquidity.setPool.
+   The pool's hook must bind the same INK, collection, vault, manager and treasury; on Ethereum
+   its other currency must be IMD. PositionManager must bind the same PoolManager.
 8. Prepare production snapshot proofs, production website/API and an approved claim start.
    Verify vault INK funding and every setup precondition BEFORE InkVault.setup.
 9. Owner calls InkVault.setup with the validated production root, approved start and
    liquidity address. This establishes the 24-hour claim window; do not do it early.
 10. At the proper time after claims, call release and verify allocation/liquidity changes
     and trading. Test claim/pull/reveal/return and real router paths with small amounts.
+
+One-time setters now reject invalid bindings and incomplete liquidity configuration.
+Each owned contract rejects renunciation while its required configuration is missing.
+These checks do not validate snapshot contents, art completeness or the intended schedule:
+the owner still reviews those values before committing them.
+
+Pull and trait reveals must be serviced while the next-block hash is available (through
+request block + 257). A trait request that expires closes with its old seed and no fee refund.
+A pull with no recorded entropy closes and refunds 400,000 INK minus the reroll fee fixed
+at purchase. If admission began in time, its recorded hash survives expiry. Neither path
+grants a free replacement draw. Clients must distinguish expired pulls using `pullExpired`
+and keep processing while `nextReveal < pullCount`, even when `revealNext` returns zero.
 
 Use actual deployed ABIs to prepare decoded transactions; the list above is not a batch
 transaction or authorization to send one. Constructor or logic changes require fresh review.

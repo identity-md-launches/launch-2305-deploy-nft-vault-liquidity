@@ -1,6 +1,13 @@
 # Launch requests for the IMD swarm
 
-Drafts of the `launch.open` inputs. Each launch costs 0.5 IMD. Before paying, run the free check:
+Drafts of the `launch.open` inputs. Each launch costs 0.5 IMD.
+
+For the current Ethereum assignment, `mainnet-1-contracts.json` names only InkPortraits,
+InkVault, InkLiquidity and InkRenderer, in that order. InkFeeRouter is an owner deployment
+outside this launch. [ADAPTATION.md](../ADAPTATION.md) records the constructor values and fixes.
+These request drafts are not the factory manifest; the later manifest step writes `launch.json`.
+
+Before paying, run the free check:
 
 ```sh
 jq '{action, input}' sepolia-1-contracts.json | curl -s -X POST https://api.imd.fun/requests/check -H 'Content-Type: application/json' --data-binary @-

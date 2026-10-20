@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {ConfiguredLiquidity} from "./helpers/ConfiguredLiquidity.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
@@ -18,11 +19,6 @@ contract FuzzSeats is ERC721("identity.md", "IMD-ID") {
 }
 
 /// Takes the released INK and does nothing with it; the real InkLiquidity is covered by the fork tests.
-contract SinkLiquidity {
-    function addLiquidity() external pure returns (uint256) {
-        return 0;
-    }
-}
 
 /// Drives the vault through random sequences of everything people can do with it.
 contract VaultHandler is Test {
@@ -215,11 +211,21 @@ contract VaultHandler is Test {
             vault.reveal(pullId);
             return;
         }
+        uint256 head = vault.nextReveal();
         vault.reveal(pullId);
+        _accountExpiries(head);
     }
 
     function revealNext(uint256 max) external counted("revealNext") {
+        uint256 head = vault.nextReveal();
         vault.revealNext(bound(max, 1, 80));
+        _accountExpiries(head);
+    }
+
+    function _accountExpiries(uint256 head) internal {
+        for (uint256 i = head; i < vault.nextReveal(); i++) {
+            if (vault.pullExpired(i)) feesToLiquidity += vault.pullExpiryFee(i);
+        }
     }
 
     function deposit(uint256 actorSeed, uint256 pick) external counted("deposit") {
@@ -300,7 +306,7 @@ contract VaultInvariantsTest is Test {
     InkPortraits portraits;
     MockERC20 ink;
     FuzzSeats seats;
-    SinkLiquidity sink;
+    ConfiguredLiquidity sink;
     VaultHandler handler;
     address owner = makeAddr("owner");
 
@@ -311,7 +317,7 @@ contract VaultInvariantsTest is Test {
         portraits = new InkPortraits(owner);
         vault = new InkVault(portraits, seats, owner);
         ink = new MockERC20("INK", "INK", 18);
-        sink = new SinkLiquidity();
+        sink = new ConfiguredLiquidity(IERC20(address(ink)));
         vm.prank(owner);
         portraits.setVault(address(vault));
         ink.mint(address(vault), 2000 * PORTRAIT);

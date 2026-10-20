@@ -11,6 +11,19 @@ interface IInkRenderer {
 
 interface IInkTraitRerolls {
     function traitRerollBlock(uint256 tokenId) external view returns (uint64);
+    function liquidity() external view returns (address);
+}
+
+interface IInkPortraitBinding {
+    function portraits() external view returns (address);
+}
+
+interface IInkVaultBinding {
+    function seats() external view returns (address);
+}
+
+interface IInkRendererBinding {
+    function chunkCount() external view returns (uint256);
 }
 
 /// @title Ink & Inference portraits
@@ -68,6 +81,10 @@ contract InkPortraits is ERC721, ERC2981, Ownable {
     error NoRenderer();
     error SwarmStarted();
     error RerollPending();
+    error InvalidBinding();
+    error UseDeposit();
+    error SetupIncomplete();
+    error InvalidRecipient();
 
     constructor(address owner_) ERC721("Ink & Inference", "INKINF") Ownable(owner_) {
         _setDefaultRoyalty(owner_, ROYALTY_BPS);
@@ -82,12 +99,18 @@ contract InkPortraits is ERC721, ERC2981, Ownable {
 
     function setVault(address vault_) external onlyOwner {
         if (vault != address(0)) revert VaultAlreadySet();
+        _checkBinding(vault_);
+        // The renderer also exposes portraits(); distinguish the two application types.
+        if (IInkVaultBinding(vault_).seats() == address(0)) revert InvalidBinding();
         vault = vault_;
         emit VaultSet(vault_);
     }
 
     function setRenderer(address renderer_) external onlyOwner {
         if (rendererLocked) revert Locked();
+        _checkBinding(renderer_);
+        // Reject a vault mistakenly supplied as the renderer, even though its collection matches.
+        IInkRendererBinding(renderer_).chunkCount();
         renderer = renderer_;
         emit RendererSet(renderer_);
         emit BatchMetadataUpdate(0, type(uint256).max);
@@ -105,6 +128,17 @@ contract InkPortraits is ERC721, ERC2981, Ownable {
     function setContractURI(string calldata uri) external onlyOwner {
         contractURI = uri;
         emit ContractURIUpdated();
+    }
+
+    function _checkBinding(address target) internal view {
+        if (target.code.length == 0 || IInkPortraitBinding(target).portraits() != address(this)) {
+            revert InvalidBinding();
+        }
+    }
+
+    function renounceOwnership() public override onlyOwner {
+        if (vault == address(0) || renderer == address(0)) revert SetupIncomplete();
+        super.renounceOwnership();
     }
 
     // ---------------------------------------------------------------- minting (vault only)
@@ -202,8 +236,13 @@ contract InkPortraits is ERC721, ERC2981, Ownable {
     }
 
     function _update(address to, uint256 tokenId, address auth) internal override returns (address from) {
+        // Only deposit() accounts for custody and releases backing to the holder.
+        if (to == vault && msg.sender != vault) revert UseDeposit();
+        if (to != address(0) && vault != address(0) && to == IInkTraitRerolls(vault).liquidity()) {
+            revert InvalidRecipient();
+        }
         // A buyer must receive the traits offered for sale. Only the holder can request a reroll and
-        // anyone can finish it; there is no owner-controlled transfer lock. Minting needs no vault call.
+        // anyone can finish it; there is no owner-controlled transfer lock. Mints skip the reroll check.
         if (
             _ownerOf(tokenId) != address(0) && !isAgentPortrait(tokenId)
                 && IInkTraitRerolls(vault).traitRerollBlock(tokenId) != 0

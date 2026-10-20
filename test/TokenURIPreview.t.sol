@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {ConfiguredLiquidity} from "./helpers/ConfiguredLiquidity.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
@@ -41,7 +42,7 @@ contract TokenURIPreviewTest is Test {
         portraits.setVault(address(vault));
         portraits.setRenderer(address(renderer));
         vault.setInk(IERC20(address(ink)));
-        vault.setup(leaf, uint64(block.timestamp), address(this)); // never released: any contract stands in
+        vault.setup(leaf, uint64(block.timestamp), address(new ConfiguredLiquidity(IERC20(address(ink))))); // Configured test double; this test never releases.
         for (uint256 off; off < art.length; off += chunk) {
             uint256 end = off + chunk > art.length ? art.length : off + chunk;
             bytes memory part = new bytes(end - off);

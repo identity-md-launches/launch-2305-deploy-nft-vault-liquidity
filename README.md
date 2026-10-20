@@ -1,8 +1,15 @@
 # Ink & Inference — portable launch source
 
-This is launch SOURCE, not approval to deploy. It has not been independently audited,
-uploaded, paid for or deployed by packaging. It does not include the real snapshot,
-owner/paying wallet, private cutoff, keys, RPC credentials or completed launch inputs.
+This is launch source. Original packaging did not audit, upload, pay for or deploy these
+contracts. The package does not include the real snapshot, private cutoff, keys,
+RPC credentials or confirmed deployed application addresses.
+
+The Ethereum contracts-only adaptation is documented in [ADAPTATION.md](ADAPTATION.md),
+including the supplied owner, the four-contract deployment order, reproduced audit fixes,
+and validation results. INK and its hook/pool belong to the later launch; the owner deploys
+InkFeeRouter separately. Original packaging fingerprints (`SHA256SUMS`,
+`BYTECODE_HASHES.json`, `SOURCE_PROVENANCE.json`, `VALIDATION.txt`) describe the imported
+baseline, not this adapted source.
 
 ## Included
 
@@ -23,9 +30,8 @@ Install Foundry using https://getfoundry.sh/ and use the version recorded in VAL
 Run at this directory's root:
 
 ```sh
-sha256sum -c SHA256SUMS
 forge build
-forge test -vv
+FOUNDRY_FUZZ_SEED=0x5ba4a490487a4af407fdbe3b9c8ca3151a1870567475ec05d2caa23cfe03a32d forge test -vv
 ```
 
 Solidity 0.8.26 may be downloaded by Foundry if not already installed. No RPC, wallet,
@@ -34,7 +40,7 @@ The default profile is read-only. `FOUNDRY_PROFILE=preview forge test --mt test_
 the rendered tokenURIs to `out-preview/` to open by eye; it is ignored and excluded from the archive.
 
 The build uses Cancun, optimizer 200, no via-IR and bytecode_hash none, as in the source project.
-Production bytecode was compared across two clean builds; see BYTECODE_HASHES.json.
+Imported production bytecode was compared across two clean builds; see the historical BYTECODE_HASHES.json.
 Renderer/preview tests use the real original art; snapshot tests use invented metrics.
 Do not claim this validates the actual mainnet snapshot or original snapshot-fetching pipeline.
 

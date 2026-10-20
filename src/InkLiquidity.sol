@@ -16,6 +16,8 @@ import {Actions} from "v4-periphery/src/libraries/Actions.sol";
 import {ActionConstants} from "v4-periphery/src/libraries/ActionConstants.sol";
 import {LiquidityAmounts} from "v4-periphery/src/libraries/LiquidityAmounts.sol";
 import {SqrtPriceMath} from "v4-core/libraries/SqrtPriceMath.sol";
+import {InkHook} from "./InkHook.sol";
+import {InkVault} from "./InkVault.sol";
 
 /// @title Ink liquidity
 /// @notice Adds INK to the INK/IMD pool and keeps the positions forever: it has no way to remove
@@ -61,6 +63,7 @@ contract InkLiquidity is Ownable, IERC721Receiver {
     /// @notice addLiquidity() waits until at least one portrait's worth of INK has built up, so fees go back
     /// in as a few sizeable positions rather than many dust ones (which would also be cheaper to sandwich).
     uint256 public constant MIN_ADD = 400_000e18;
+    address public constant MAINNET_IMD = 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7;
 
     uint256[] public positions;
 
@@ -80,6 +83,9 @@ contract InkLiquidity is Ownable, IERC721Receiver {
     error BadPremium();
     error NothingToCollect();
     error ZeroTreasury();
+    error InvalidHook();
+    error InvalidPositionManager();
+    error UnexpectedNFT();
 
     constructor(
         IPoolManager poolManager_,
@@ -100,11 +106,36 @@ contract InkLiquidity is Ownable, IERC721Receiver {
         if (!(key.currency0 == c || key.currency1 == c)) revert NotInkPool();
         (uint160 sqrtPriceX96, int24 tick,,) = poolManager.getSlot0(key.toId());
         if (sqrtPriceX96 == 0) revert PoolNotInitialized();
+        _checkHook(key, ink_);
+        if (address(positionManager.poolManager()) != address(poolManager)) revert InvalidPositionManager();
         poolKey = key;
         ink = ink_;
         poolSet = true;
         floorTick = tick;
         emit PoolSet(key.toId(), address(ink_));
+    }
+
+    /// @dev The later hook launch supplies these bindings; no dependency is called in the constructor.
+    function _checkHook(PoolKey calldata key, IERC20 ink_) internal view {
+        if (address(key.hooks).code.length == 0) revert InvalidHook();
+        InkHook hook = InkHook(address(key.hooks));
+        Currency other = Currency.unwrap(key.currency0) == address(ink_) ? key.currency1 : key.currency0;
+        if (
+            !hook.poolCreated() || address(hook.poolManager()) != address(poolManager)
+                || Currency.unwrap(hook.ink()) != address(ink_)
+                || Currency.unwrap(hook.imd()) != Currency.unwrap(other) || hook.treasury() != treasury
+                || (block.chainid == 1 && Currency.unwrap(other) != MAINNET_IMD)
+        ) revert InvalidHook();
+        InkVault boundVault = InkVault(address(hook.vault()));
+        if (
+            boundVault.ink() != ink_ || address(boundVault.portraits()) != address(hook.portraits())
+                || boundVault.portraits().vault() != address(boundVault) || boundVault.owner() != owner()
+        ) revert InvalidHook();
+    }
+
+    function renounceOwnership() public override onlyOwner {
+        if (!poolSet) revert PoolNotSet();
+        super.renounceOwnership();
     }
 
     function setWidth(int24 width_) external onlyOwner {
@@ -283,7 +314,8 @@ contract InkLiquidity is Ownable, IERC721Receiver {
         return positions.length;
     }
 
-    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+    function onERC721Received(address, address, uint256, bytes calldata) external view returns (bytes4) {
+        if (msg.sender != address(positionManager)) revert UnexpectedNFT();
         return IERC721Receiver.onERC721Received.selector;
     }
 

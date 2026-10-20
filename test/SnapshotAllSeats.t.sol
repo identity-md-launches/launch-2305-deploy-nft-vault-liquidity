@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {ConfiguredLiquidity} from "./helpers/ConfiguredLiquidity.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
@@ -52,14 +53,37 @@ contract SnapshotAllSeatsTest is Test {
 
     // All 2,000 claims, in eight batches (one test can't hold 2,000 claims' worth of memory; each real claim is
     // its own transaction).
-    function test_claims_0000() public onlySnapshot { _batch(0); }
-    function test_claims_0250() public onlySnapshot { _batch(250); }
-    function test_claims_0500() public onlySnapshot { _batch(500); }
-    function test_claims_0750() public onlySnapshot { _batch(750); }
-    function test_claims_1000() public onlySnapshot { _batch(1000); }
-    function test_claims_1250() public onlySnapshot { _batch(1250); }
-    function test_claims_1500() public onlySnapshot { _batch(1500); }
-    function test_claims_1750() public onlySnapshot { _batch(1750); }
+    function test_claims_0000() public onlySnapshot {
+        _batch(0);
+    }
+
+    function test_claims_0250() public onlySnapshot {
+        _batch(250);
+    }
+
+    function test_claims_0500() public onlySnapshot {
+        _batch(500);
+    }
+
+    function test_claims_0750() public onlySnapshot {
+        _batch(750);
+    }
+
+    function test_claims_1000() public onlySnapshot {
+        _batch(1000);
+    }
+
+    function test_claims_1250() public onlySnapshot {
+        _batch(1250);
+    }
+
+    function test_claims_1500() public onlySnapshot {
+        _batch(1500);
+    }
+
+    function test_claims_1750() public onlySnapshot {
+        _batch(1750);
+    }
 
     function _batch(uint256 from) internal {
         string memory json = vm.readFile(vm.envOr("SNAPSHOT_TREE", string(DEFAULT_TREE)));
@@ -73,7 +97,7 @@ contract SnapshotAllSeatsTest is Test {
         vm.startPrank(owner);
         portraits.setVault(address(vault));
         vault.setInk(IERC20(address(ink)));
-        vault.setup(tree[0], uint64(block.timestamp), address(this)); // never released; setup needs a contract here
+        vault.setup(tree[0], uint64(block.timestamp), address(new ConfiguredLiquidity(IERC20(address(ink))))); // Configured test double; this test never releases.
         vm.stopPrank();
 
         uint256 totalGas;
@@ -91,7 +115,11 @@ contract SnapshotAllSeatsTest is Test {
         emit log_named_uint("max claim gas (execution)", maxGas);
     }
 
-    function _stats(string memory json, string memory p) internal pure returns (InkPortraits.AgentStats memory s) {
+    function _stats(string memory json, string memory p)
+        internal
+        pure
+        returns (InkPortraits.AgentStats memory s)
+    {
         s.accepted = uint32(vm.parseJsonUint(json, string.concat(p, ".value[1]")));
         s.rateBps = uint16(vm.parseJsonUint(json, string.concat(p, ".value[2]")));
         s.turns = uint32(vm.parseJsonUint(json, string.concat(p, ".value[3]")));
@@ -99,7 +127,10 @@ contract SnapshotAllSeatsTest is Test {
         s.outdated = vm.parseJsonBool(json, string.concat(p, ".value[5]"));
     }
 
-    function _claim(string memory json, bytes32[] memory tree, uint256 n) internal returns (uint256 gasUsed, uint256 depth) {
+    function _claim(string memory json, bytes32[] memory tree, uint256 n)
+        internal
+        returns (uint256 gasUsed, uint256 depth)
+    {
         string memory p = string.concat(".values[", vm.toString(n), "]");
         uint256 seat = vm.parseJsonUint(json, string.concat(p, ".value[0]"));
         InkPortraits.AgentStats memory s = _stats(json, p);
@@ -121,6 +152,8 @@ contract SnapshotAllSeatsTest is Test {
             i = (i - 1) / 2;
         }
         proof = new bytes32[](len);
-        for (uint256 k; k < len; k++) proof[k] = tmp[k];
+        for (uint256 k; k < len; k++) {
+            proof[k] = tmp[k];
+        }
     }
 }

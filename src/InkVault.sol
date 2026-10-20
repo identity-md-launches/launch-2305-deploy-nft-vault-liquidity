@@ -12,6 +12,8 @@ import {InkPortraits} from "./InkPortraits.sol";
 
 interface IInkLiquidity {
     function addLiquidity() external returns (uint256 positionId);
+    function ink() external view returns (IERC20);
+    function poolSet() external view returns (bool);
 }
 
 /// @title Ink vault
@@ -61,7 +63,7 @@ contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
     enum Step {
         Revealed,
         TooEarly,
-        Renewed,
+        Expired,
         Admitting
     }
 
@@ -93,10 +95,11 @@ contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
     Pull[] public pulls;
     /// @notice The next pull to reveal. Pulls are revealed in order.
     uint256 public nextReveal;
-    /// @dev The block a renewed pull was made in, recorded when its entropy moves to a later block. Renewal
-    /// never moves the admission cutoff: only portraits handed in before the pull was made join its draw.
-    /// Zero while the pull has never been renewed (then pulls[id].blockNumber is that block).
-    mapping(uint256 pullId => uint64) internal _madeBlock;
+    /// @notice Reroll fee fixed at purchase, retained if a pull expires without a recorded draw.
+    mapping(uint256 pullId => uint256) public pullExpiryFee;
+    mapping(uint256 pullId => bool) public pullExpired;
+    /// @dev Preserve the original draw across bounded admission calls.
+    mapping(uint256 pullId => bytes32) internal _pullEntropy;
     /// @dev How many portraits were handed in during the latest deposit block. They don't count for pulls
     /// made in that block, since those never admit them.
     uint64 internal _lastDepositBlock;
@@ -109,12 +112,12 @@ contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
     event AgentClaimed(uint256 indexed seat, address indexed to);
     event Released(uint256 unclaimedSeats, uint256 inkToPool);
     event Pulled(uint256 indexed pullId, address indexed to, uint64 blockNumber);
-    event PullRenewed(uint256 indexed pullId, uint64 blockNumber);
+    event PullExpired(uint256 indexed pullId, address indexed to, uint256 refund, uint256 fee);
     event AdmissionProgress(uint256 indexed pullId, uint256 admitted);
     event Revealed(uint256 indexed pullId, address indexed to, uint256 tokenId, bool newlyMinted);
     event Deposited(address indexed from, uint256 indexed tokenId, uint256 inkOut, uint256 fee);
     event TraitRerollRequested(uint256 indexed tokenId, address indexed by, uint256 fee, uint64 blockNumber);
-    event TraitRerollRenewed(uint256 indexed tokenId, uint64 blockNumber);
+    event TraitRerollExpired(uint256 indexed tokenId);
     event TraitsRerolled(uint256 indexed tokenId, bytes32 seed);
     event FeesSet(uint16 rerollFeeBps, uint16 agentRerollFeeBps);
 
@@ -141,6 +144,8 @@ contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
     error RerollPending();
     error NoRerollPending();
     error UseDeposit();
+    error InvalidInk();
+    error SetupIncomplete();
 
     constructor(InkPortraits portraits_, IERC721 seats_, address owner_) Ownable(owner_) {
         portraits = portraits_;
@@ -152,6 +157,8 @@ contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
     /// @notice Points the vault at INK once the swarm launch has created it.
     function setInk(IERC20 ink_) external onlyOwner {
         if (address(ink) != address(0)) revert InkAlreadySet();
+        if (address(ink_).code.length == 0) revert InvalidInk();
+        if (ink_.balanceOf(address(this)) < SEATS * PORTRAIT) revert NotFunded();
         ink = ink_;
         emit InkSet(address(ink_));
     }
@@ -166,6 +173,9 @@ contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
                 || start > block.timestamp + MAX_START_DELAY
         ) revert BadSetup();
         if (ink.balanceOf(address(this)) < SEATS * PORTRAIT) revert NotFunded();
+        if (IInkLiquidity(liquidity_).ink() != ink || !IInkLiquidity(liquidity_).poolSet()) {
+            revert BadSetup();
+        }
         statsRoot = root;
         claimStart = start;
         claimEnd = start + CLAIM_WINDOW;
@@ -178,6 +188,11 @@ contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
         rerollFeeBps = baseBps;
         agentRerollFeeBps = agentBps;
         emit FeesSet(baseBps, agentBps);
+    }
+
+    function renounceOwnership() public override onlyOwner {
+        if (statsRoot == bytes32(0)) revert SetupIncomplete();
+        super.renounceOwnership();
     }
 
     // ---------------------------------------------------------------- agent portraits
@@ -240,6 +255,8 @@ contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
     /// @notice Locks 400,000 INK per pull and queues that many random portraits. Opens at release, and only
     /// while there are enough portraits (unminted slots, the vault's inventory and ones handed in before this
     /// block that are waiting to join it) for every queued pull.
+    /// If nobody records the draw before its hash expires, the pull closes and returns its backing minus
+    /// the current reroll fee, fixed here at purchase (including the agent-holder discount).
     function pull(uint256 count) external nonReentrant returns (uint256 firstPullId) {
         if (!released) revert NotReleased();
         if (count == 0) revert ZeroPulls();
@@ -248,7 +265,10 @@ contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
         if (pulls.length - nextReveal + count > available() + waitingBefore()) revert NoneAvailable();
         ink.safeTransferFrom(msg.sender, address(this), count * PORTRAIT);
         firstPullId = pulls.length;
+        uint256 expiryFee =
+            (PORTRAIT * (portraits.isAgentHolder(msg.sender) ? agentRerollFeeBps : rerollFeeBps)) / 10_000;
         for (uint256 i; i < count; i++) {
+            pullExpiryFee[firstPullId + i] = expiryFee;
             pulls.push(Pull({to: msg.sender, blockNumber: uint64(block.number), done: false}));
             emit Pulled(firstPullId + i, msg.sender, uint64(block.number));
         }
@@ -256,12 +276,10 @@ contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
 
     /// @notice Reveals every pull up to and including `pullId`, in order. Anyone can call it; each portrait
     /// goes to its puller (without the ERC-721 receiver check, so a contract puller can't veto its draw).
-    /// Stops early, keeping what it did, when a pull has to be renewed: its block hash is older than 256
-    /// blocks, or no portrait is free. A renewed pull is drawn from a later block hash, over the same candidates:
-    /// renewal never lets a later hand-in join its draw, or the draw of any pull queued behind it.
+    /// An expired pull closes with a refund minus its fixed reroll fee, never with a free replacement draw.
     /// Also stops after a bounded admission batch if more eligible deposits remain. Call again to finish;
     /// no draw occurs until all deposits eligible for that pull have joined, preserving its candidate set.
-    /// @return done Whether `pullId` itself was revealed.
+    /// @return done Whether `pullId` itself was revealed (false if expired or still pending).
     function reveal(uint256 pullId) external nonReentrant returns (bool done) {
         if (pullId >= pulls.length) revert UnknownPull();
         if (pullId < nextReveal) revert AlreadyRevealed();
@@ -272,18 +290,19 @@ contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
                 if (!progressed) revert TooEarly();
                 return false;
             }
-            if (step == Step.Renewed || step == Step.Admitting) return false;
+            if (step == Step.Admitting) return false;
             progressed = true;
         }
-        return true;
+        return !pullExpired[pullId];
     }
 
-    /// @notice Reveals up to `max` pulls in order; for working through a long queue in several calls.
+    /// @notice Processes up to `max` pulls in order; returns the number of portraits actually revealed.
     /// May admit deposits without revealing a pull; call again while pulls remain pending.
     function revealNext(uint256 max) external nonReentrant returns (uint256 revealed) {
-        while (revealed < max && nextReveal < pulls.length) {
-            if (_revealNext() != Step.Revealed) break;
-            revealed++;
+        for (uint256 processed; processed < max && nextReveal < pulls.length; processed++) {
+            Step step = _revealNext();
+            if (step == Step.TooEarly || step == Step.Admitting) break;
+            if (step == Step.Revealed) revealed++;
         }
     }
 
@@ -292,24 +311,32 @@ contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
         Pull storage p = pulls[pullId];
         if (block.number <= uint256(p.blockNumber) + 1) return Step.TooEarly;
 
-        // Portraits handed in before the pull was made join the draw; later ones wait for later pulls. A
-        // renewal moves only the entropy block: the cutoff stays, so the pulls queued behind this one, whose
-        // block hashes may already be public, never see portraits handed in after their own blocks.
-        uint64 made = _madeBlock[pullId];
-        if (made == 0) made = p.blockNumber;
-        if (!_admit(made)) {
+        bytes32 entropy = _pullEntropy[pullId];
+        if (entropy == bytes32(0)) {
+            entropy = blockhash(uint256(p.blockNumber) + 1);
+            if (entropy == bytes32(0)) {
+                p.done = true;
+                pullExpired[pullId] = true;
+                nextReveal = pullId + 1;
+                uint256 fee = pullExpiryFee[pullId];
+                // Equivalent to returning an unwanted swarm portrait: no free retry, and the next
+                // puller can progress without this holder's cooperation or allowance.
+                ink.safeTransfer(p.to, PORTRAIT - fee);
+                if (fee != 0) ink.safeTransfer(liquidity, fee);
+                emit PullExpired(pullId, p.to, PORTRAIT - fee, fee);
+                return Step.Expired;
+            }
+            _pullEntropy[pullId] = entropy;
+        }
+        // Only hand-ins from before this pull may join its draw, including across admission batches.
+        if (!_admit(p.blockNumber)) {
             emit AdmissionProgress(pullId, MAX_ADMISSIONS);
             return Step.Admitting;
         }
-        bytes32 entropy = blockhash(uint256(p.blockNumber) + 1);
         uint256 avail = available();
         // avail is never 0 here: pull() only counts portraits that this cutoff admits, and each reveal takes one.
-        if (entropy == bytes32(0) || avail == 0) {
-            if (_madeBlock[pullId] == 0) _madeBlock[pullId] = made;
-            p.blockNumber = uint64(block.number);
-            emit PullRenewed(pullId, p.blockNumber);
-            return Step.Renewed;
-        }
+        if (avail == 0) revert NoneAvailable();
+        delete _pullEntropy[pullId];
         p.done = true;
         nextReveal = pullId + 1;
         uint256 r = uint256(keccak256(abi.encode(entropy, pullId)));
@@ -400,19 +427,19 @@ contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
     }
 
     /// @notice Applies a pending trait reroll once its block hash is known. Anyone can call it. If the hash
-    /// has expired (older than 256 blocks) the reroll is renewed from a later block instead.
+    /// has expired (older than 256 blocks), close the request and keep the old seed. The fee is spent;
+    /// another draw requires another paid reroll. Anyone can clear the transfer lock this way.
     /// @return done Whether the portrait was repainted.
     function revealTraits(uint256 tokenId) external nonReentrant returns (bool done) {
         uint64 b = traitRerollBlock[tokenId];
         if (b == 0) revert NoRerollPending();
         if (block.number <= uint256(b) + 1) revert TooEarly();
         bytes32 entropy = blockhash(uint256(b) + 1);
+        delete traitRerollBlock[tokenId];
         if (entropy == bytes32(0)) {
-            traitRerollBlock[tokenId] = uint64(block.number);
-            emit TraitRerollRenewed(tokenId, uint64(block.number));
+            emit TraitRerollExpired(tokenId);
             return false;
         }
-        delete traitRerollBlock[tokenId];
         bytes32 seed = keccak256(abi.encode(entropy, tokenId, "traits"));
         portraits.setSwarmSeed(tokenId, seed);
         emit TraitsRerolled(tokenId, seed);
@@ -444,11 +471,10 @@ contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
     }
 
     /// @notice The block a pull was made in: only portraits handed in before it join that pull's draw. A
-    /// renewal (PullRenewed) moves the pull's entropy block, the one pulls() shows, but never this one.
+    /// pull's block never changes, even if its hash expires.
     function pullBlock(uint256 pullId) external view returns (uint64) {
         if (pullId >= pulls.length) revert UnknownPull();
-        uint64 made = _madeBlock[pullId];
-        return made != 0 ? made : pulls[pullId].blockNumber;
+        return pulls[pullId].blockNumber;
     }
 
     function inventoryAt(uint256 index) external view returns (uint256) {
