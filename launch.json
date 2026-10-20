@@ -1,0 +1,36 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "InkPortraits",
+      "constructorArgs": [
+        "$owner"
+      ]
+    },
+    {
+      "contract": "InkVault",
+      "constructorArgs": [
+        "$contract:InkPortraits",
+        "0x0000ec93127baa929e58e97dd0095a2bfb38ec1d",
+        "$owner"
+      ]
+    },
+    {
+      "contract": "InkLiquidity",
+      "constructorArgs": [
+        "0x000000000004444c5dc75cb358380d2e3de08a90",
+        "0xbd216513d74c8cf14cf4747e6aaa6420ff64ee9e",
+        "$owner",
+        "0xbc10b3662231c830d2ee10bc6359db17bea4b3d4"
+      ]
+    },
+    {
+      "contract": "InkRenderer",
+      "constructorArgs": [
+        "$contract:InkPortraits",
+        "$owner"
+      ]
+    }
+  ],
+  "notes": "Ethereum mainnet deployment of InkPortraits, InkVault, InkLiquidity and InkRenderer in the listed order. Every owner argument and the NFT royalty recipient resolve to $owner. InkVault uses the specified seats NFT. InkLiquidity uses the official Uniswap v4 Ethereum PoolManager and PositionManager listed at https://developers.uniswap.org/docs/protocols/v4/deployments; its treasury receives IMD fees only and has no owner role. InkFeeRouter is deployed separately by the owner. InkHook and src/testnet contracts are excluded. This manifest includes no token or pool deployment, ETH funding or initialization calls."
+}
