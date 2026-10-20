@@ -78,8 +78,38 @@ contract RendererBoundaryPropertiesTest is Test {
     }
 
     function test_ownershipTransferRevokesOldOwnerAcrossEveryRendererMutation() public {
+        bytes memory outsiderDenied =
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, outsider);
+        address stranger = makeAddr("renderer boundary stranger");
+
         vm.prank(owner);
         renderer.transferOwnership(outsider);
+        // Two-step: nothing moves until the nominee accepts.
+        assertEq(renderer.owner(), owner);
+        assertEq(renderer.pendingOwner(), outsider);
+        vm.startPrank(outsider);
+        vm.expectRevert(outsiderDenied);
+        renderer.addChunk("premature art");
+        vm.expectRevert(outsiderDenied);
+        renderer.setPreviewBase("ipfs://premature/");
+        vm.expectRevert(outsiderDenied);
+        renderer.lock();
+        vm.stopPrank();
+        // Nobody but the nominee can complete the handover, not even the current owner.
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        renderer.acceptOwnership();
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, owner));
+        renderer.acceptOwnership();
+        assertEq(renderer.owner(), owner);
+        assertEq(renderer.chunkCount(), 0);
+
+        vm.prank(outsider);
+        renderer.acceptOwnership();
+        assertEq(renderer.owner(), outsider);
+        assertEq(renderer.pendingOwner(), address(0));
+
         vm.startPrank(owner);
         bytes memory denied = abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, owner);
         vm.expectRevert(denied);
@@ -89,6 +119,8 @@ contract RendererBoundaryPropertiesTest is Test {
         vm.expectRevert(denied);
         renderer.lock();
         vm.expectRevert(denied);
+        renderer.transferOwnership(owner);
+        vm.expectRevert(denied);
         renderer.renounceOwnership();
         vm.stopPrank();
         vm.startPrank(outsider);
@@ -97,7 +129,8 @@ contract RendererBoundaryPropertiesTest is Test {
         vm.stopPrank();
         assertEq(renderer.owner(), outsider);
         assertEq(renderer.script(), bytes("accepted art"));
-        // Renderer ownership cannot silently replace the NFT's royalty recipient.
+        // Renderer ownership cannot silently replace the NFT's owner or royalty recipient.
+        assertEq(portraits.owner(), owner);
         (address receiver,) = portraits.royaltyInfo(0, 1 ether);
         assertEq(receiver, owner);
     }

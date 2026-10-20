@@ -25,7 +25,8 @@ settlement fails, followed by a successful retry.
 
 `RendererBoundaryProperties.t.sol` adds 1,000 binary chunk round-trip fuzz cases,
 the maximum EIP-170 chunk boundary, rejected writes, permanent locking, and
-revocation of the previous renderer owner's authority after an ownership transfer.
+the two-step renderer ownership handover (no authority for the nominee before
+acceptance, only the nominee can accept, and the previous owner is revoked after).
 
 These tests need no RPC, credentials, environment mutation or new dependencies.
 Run them and the existing suite with:
