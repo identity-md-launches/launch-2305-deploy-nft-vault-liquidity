@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {Base64} from "@openzeppelin/contracts/utils/Base64.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {InkPortraits, IInkRenderer, IInkTraitRerolls} from "./InkPortraits.sol";
@@ -13,7 +14,7 @@ import {InkPortraits, IInkRenderer, IInkTraitRerolls} from "./InkPortraits.sol";
 /// - an animation_url holding a self-contained HTML page that runs the script with the token's inputs;
 /// - an image URL from previewBase, for marketplaces that need a still (set before locking).
 /// The script is uploaded in chunks, each stored as the code of a small data contract, then locked forever.
-contract InkRenderer is IInkRenderer, Ownable {
+contract InkRenderer is IInkRenderer, Ownable2Step {
     using Strings for uint256;
 
     uint256 public constant MAX_CHUNK = 24_575;

@@ -126,8 +126,8 @@ abstract contract InkSteps is Script {
         _require(root != bytes32(0), "snapshot root");
         _require(start >= block.timestamp && start <= block.timestamp + 30 days, "claim start within 30 days");
         vault.setInk(ink);
-        // Premium first: once anyone lists INK through addLiquidity() (a dust donation is enough), the
-        // premium can no longer be set, and setPool() is what makes addLiquidity() callable.
+        // Premium first, as the documented order. addLiquidity() is only callable from the vault's release
+        // on, so this order is no longer load-bearing: nobody can list INK and lock the premium before it.
         liq.setPremium(RELEASE_PREMIUM);
         liq.setPool(key, ink);
         vault.setup(root, start, address(liq));

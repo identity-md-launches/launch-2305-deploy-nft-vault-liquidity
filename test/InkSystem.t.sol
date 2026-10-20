@@ -897,7 +897,7 @@ contract InkSystemTest is Test, Deployers, DeployPermit2 {
         vm.stopPrank();
         vm.expectRevert(InkLiquidity.PoolNotSet.selector);
         l2.addLiquidity();
-        vm.expectRevert(InkLiquidity.NothingToAdd.selector);
+        vm.expectRevert(InkLiquidity.NotReleased.selector);
         liq.addLiquidity();
         vm.prank(other);
         vm.expectRevert();
@@ -1046,11 +1046,15 @@ contract InkSystemTest is Test, Deployers, DeployPermit2 {
         }
         vm.prank(owner);
         vault.transferOwnership(other);
+        vm.prank(other);
+        vault.acceptOwnership();
         vm.prank(owner);
         vm.expectRevert(InkLiquidity.InvalidHook.selector);
         fresh.setPool(poolKey, IERC20(address(ink)));
         vm.prank(other);
         vault.transferOwnership(owner);
+        vm.prank(owner);
+        vault.acceptOwnership();
         vm.mockCall(address(portraits), abi.encodeWithSignature("vault()"), abi.encode(other));
         vm.prank(owner);
         vm.expectRevert(InkLiquidity.InvalidHook.selector);
@@ -1159,6 +1163,57 @@ contract InkSystemTest is Test, Deployers, DeployPermit2 {
         assertEq(imdOut, 0);
         assertEq(inkKept, 0);
         assertGt(posm.getPositionLiquidity(liq.positions(0)), 0);
+    }
+
+    /// Review finding b22beff1453b: between setPool() and setPremium(), anyone holding MIN_ADD INK could list
+    /// a zero-premium ladder and lock the premium at 0 forever. INK is now listed only from release on, so
+    /// the owner's setPremium() cannot be front-run however setPool() and setPremium() are ordered.
+    function test_premiumCannotBeLockedByListingBeforeRelease() public {
+        InkLiquidity l2 = new InkLiquidity(manager, posm, owner, treasury);
+        vm.prank(owner);
+        l2.setPool(poolKey, IERC20(address(ink)));
+        assertEq(address(l2.vault()), address(vault));
+        ink.mint(address(l2), l2.MIN_ADD());
+        vm.prank(other);
+        vm.expectRevert(InkLiquidity.NotReleased.selector);
+        l2.addLiquidity();
+        assertEq(l2.positionCount(), 0);
+        vm.prank(owner);
+        l2.setPremium(16_000);
+        assertEq(l2.premium(), 16_000);
+
+        _release();
+        vm.prank(other);
+        uint256 first = l2.addLiquidity();
+        assertEq(l2.positionCount(), l2.LADDER_BANDS(), "the release ladder, from the premium");
+        (, PositionInfo info) = posm.getPoolAndPositionInfo(first);
+        if (inkIs0) assertEq(info.tickLower(), l2.releaseStartTick() + SPACING);
+        else assertEq(info.tickUpper(), l2.releaseStartTick());
+        vm.prank(owner);
+        vm.expectRevert(InkLiquidity.BadPremium.selector);
+        l2.setPremium(0);
+        assertLt(ink.balanceOf(address(l2)), l2.MIN_ADD(), "only rounding dust is left");
+        vm.expectRevert(InkLiquidity.BelowMinAdd.selector);
+        l2.addLiquidity();
+    }
+
+    /// Review finding 68252bb4caa5: a one-step transfer to a wrong address would strand the pool wiring.
+    function test_liquidityOwnershipTransferRequiresAcceptance() public {
+        vm.prank(owner);
+        liq.transferOwnership(other);
+        assertEq(liq.owner(), owner);
+        assertEq(liq.pendingOwner(), other);
+        vm.prank(owner);
+        liq.setWidth(4 * SPACING);
+        vm.prank(other);
+        liq.acceptOwnership();
+        assertEq(liq.owner(), other);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, owner));
+        liq.setWidth(5 * SPACING);
+        vm.prank(other);
+        liq.setWidth(5 * SPACING);
+        assertEq(liq.width(), 5 * SPACING);
     }
 
     /// The premium can be set before the pool, which is the order the launch step uses: until setPool()

@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {ERC2981} from "@openzeppelin/contracts/token/common/ERC2981.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
 interface IInkRenderer {
     function tokenURI(uint256 tokenId) external view returns (string memory);
@@ -32,7 +33,7 @@ interface IInkRendererBinding {
 /// - Swarm portraits: token ids from 10,000, painted from a random seed. Each one fills an unclaimed seat's
 ///   number: the k-th swarm portrait is numbered after the k-th unclaimed seat (see swarmNumber).
 /// - 0% trading fee: ERC-2981 reports a zero royalty, so marketplaces show no creator fee on resales.
-contract InkPortraits is ERC721, ERC2981, Ownable {
+contract InkPortraits is ERC721, ERC2981, Ownable2Step {
     uint256 public constant MAX_SUPPLY = 2000;
     uint256 public constant SEAT_COUNT = 2000;
     uint256 public constant SWARM_ID_OFFSET = 10_000;
@@ -64,6 +65,10 @@ contract InkPortraits is ERC721, ERC2981, Ownable {
     mapping(address => uint256) public agentBalanceOf;
     /// @notice The block an address last went from holding no agent portrait to holding one.
     mapping(address => uint256) public agentHolderSince;
+    /// @notice Whether a swarm portrait's current holder received it from the vault (a pull) and has not
+    /// moved it since. The vault's agent-holder reroll discount applies only to such portraits, so a
+    /// contract that parks one agent portrait can't resell the discount on portraits handed to it.
+    mapping(uint256 tokenId => bool) public heldFromVault;
 
     event VaultSet(address vault);
     event RendererSet(address renderer);
@@ -181,8 +186,15 @@ contract InkPortraits is ERC721, ERC2981, Ownable {
 
     /// @notice Whether `holder` gets agent-holder perks (no hook fee, half-price rerolls): it holds an agent
     /// portrait and has since an earlier block, so a portrait lent for one transaction doesn't count.
-    function isAgentHolder(address holder) external view returns (bool) {
+    function isAgentHolder(address holder) public view returns (bool) {
         return agentBalanceOf[holder] > 0 && agentHolderSince[holder] < block.number;
+    }
+
+    /// @notice Whether `holder` pays the agent-holder reroll fee on swarm portrait `tokenId`: it is an agent
+    /// holder and the portrait came to it straight from the vault. A portrait received from anyone else
+    /// (a sale, or a hand-in through a contract that holds an agent portrait) pays the full fee.
+    function hasRerollDiscount(address holder, uint256 tokenId) external view returns (bool) {
+        return heldFromVault[tokenId] && _ownerOf(tokenId) == holder && isAgentHolder(holder);
     }
 
     /// @notice The number a swarm portrait goes by: the seat number it fills. Swarm portrait k (token id
@@ -251,6 +263,9 @@ contract InkPortraits is ERC721, ERC2981, Ownable {
         if (isAgentPortrait(tokenId)) {
             if (from != address(0)) agentBalanceOf[from]--;
             if (to != address(0) && agentBalanceOf[to]++ == 0) agentHolderSince[to] = block.number;
+        } else {
+            // Only the vault's own hand-outs (mintSwarm, a revealed inventory portrait) keep the discount.
+            heldFromVault[tokenId] = msg.sender == vault;
         }
     }
 }

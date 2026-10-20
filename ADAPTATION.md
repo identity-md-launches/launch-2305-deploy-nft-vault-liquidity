@@ -145,6 +145,101 @@ randomness; permissionless liquidity placement at spot subject to the existing f
 control over bounded fees, liquidity parameters and presentation until the existing locks;
 and no time fallback if the owner never completes setup. These were not redesigned.
 
+## Revision: independent review findings
+
+An independent reviewer reopened the accepted work with one reproducible finding and nine
+advisory ones. Each was reproduced before anything changed. `.imd-responses.json` carries the
+verdicts; this section records what changed and why.
+
+### 16c7464acc9e — reroll discount resold through an agent-holding contract (medium): reproduced and fixed
+
+The supplied proof failed on the accepted tree (a non-holder paid 2,000 instead of 4,000 INK by
+handing a swarm portrait in through a contract that parks one agent portrait). The cause: the
+discount was priced from `isAgentHolder(msg.sender)`, which says who is calling, not whose
+portrait is being handed in. Any check on the caller alone (a "held since an earlier block"
+rule on the swarm portrait, a code-length check) still leaves a standing custodial contract able to
+extend the discount with a one-block delay, so the fix keys the discount to the portrait's own
+history instead:
+
+- `src/InkPortraits.sol`: `_update` records `heldFromVault(tokenId)` for swarm portraits: true while
+  the current holder received the portrait straight from the vault (a pull's mint or a revealed
+  inventory portrait) and has not moved it since; any other transfer clears it. A trait reroll
+  changes no owner, so it keeps the flag. `hasRerollDiscount(holder, tokenId)` combines it with
+  ownership and the existing `isAgentHolder` rule. `isAgentHolder` is now `public` so the view can
+  reuse it; its ABI is unchanged.
+- `src/InkVault.sol`: `deposit()` prices a swarm portrait at `agentRerollFeeBps` only when the
+  caller is an agent holder **and** `heldFromVault` is true for that portrait (read before the
+  vault's own transfer, which would set it); `rerollTraits()` uses `hasRerollDiscount`. Agent
+  portraits still return exactly 400,000 INK. `pull()` is unchanged: the expiry fee is fixed for the
+  puller, who is also the recipient, so there is no third party to price it for.
+
+Effect on honest holders: an agent-portrait holder pays half on the swarm portraits it pulled and
+still holds (its own luck), which is the reroll the discount was for. A swarm portrait bought on a
+marketplace or received from another wallet pays the full fee, even for an agent holder; this is
+the same flow the proxy used (the proxy "bought" the portrait for the payout), so it cannot be
+exempted without reopening the finding. The residual delegation left is a custodial wrapper that
+pulls on users' behalf and keeps the portraits in its own custody; it cannot reach portraits held
+in users' wallets, which is the delegation the finding described.
+
+No fee rate, recipient or owner power changed. Tests: `test/LaunchSafety.t.sol` reproduces the
+proof's proxy for `deposit()` and `rerollTraits()` and expects the full fee, and checks the
+discount on own pulls, its loss on received or moved portraits, repaint keeping it, and non-holders
+unchanged. `test/InkSystem.t.sol`'s existing half-price tests still pass (they pull and hand back).
+
+### 68252bb4caa5 — one-step `transferOwnership` reaches the unrecoverable state (low): reproduced and fixed
+
+Confirmed against the accepted tree: `transferOwnership(0xdEaD)` succeeded on every contract
+while `renounceOwnership()` was guarded. All four launched contracts now inherit OpenZeppelin
+`Ownable2Step` (vendored 5.1.0): a transfer only takes effect once the new owner calls
+`acceptOwnership()`, so a wrong address never obtains ownership and the current owner can
+correct a pending transfer. Constructors still take `$owner`; no role was added; the
+`renounceOwnership` readiness guards are unchanged. `test/InkSystem.t.sol`'s hook-binding test,
+which hands the vault's ownership back and forth, now accepts each step. Tests:
+`test/LaunchSafety.t.sol` (portraits, vault, renderer) and `test/InkSystem.t.sol` (liquidity).
+
+### b22beff1453b — premium locked by a permissionless `addLiquidity()` before release (low): reproduced and fixed
+
+Confirmed on the system fixture: with `setPool()` done and `setPremium()` pending, anyone holding
+400,000 INK could list a zero-premium ladder and every later `setPremium()` reverted. There is
+nothing to list before release (the pool is swap-locked and no fee INK exists), so
+`src/InkLiquidity.sol` now records the vault the hook is bound to in `setPool()` (`vault()`, taken
+from the bindings it already validates) and `addLiquidity()` reverts `NotReleased` until
+`InkVault.released()`. `release()` sets that flag before it calls `addLiquidity()`, so the release
+path is unchanged. The documented order (premium, then pool) still works and is no longer
+load-bearing; the comment in `script/InkSteps.sol` says so. Tests: `test/InkSystem.t.sol`
+(`test_premiumCannotBeLockedByListingBeforeRelease`, and the guard test now expects `NotReleased`
+before release).
+
+### 96b69dd541d1 — `_rangeFrom` overflow with a width near `type(int24).max` (info): reproduced and fixed
+
+Confirmed by unit test: with INK as currency0 and a non-negative tick, `lower + w` panicked before
+the clamp. `_rangeFrom` now widens in `int256` and clamps to the usable tick range; `setWidth` keeps
+its existing lower bound only. `test/RangeMath.t.sol` primes a harness with both token orderings,
+checks the clamp at the maximum width, fuzzes every width and tick, and pins an ordinary range.
+
+### Advisory findings left unchanged
+
+- **70ff8571d323 (trait-reroll free option, low)**: reproduces as described and is the documented
+  residual of accepted fix 7a54cd1bfe87. The two ways to remove it are a forced reveal paid from
+  the fee (a keeper bounty, which splits the requester's fee rate) or an expiry seed derived from a
+  request-time value, which the holder can also compute and so only changes which two seeds the
+  holder chooses between. Neither is a smaller change than the current one; the cost of the abort
+  path is a 256-block transfer lock, and the fee is spent either way. Left for the owner.
+- **942e691ce965 (fee INK listed at the caller's spot tick, low)**: unchanged, as the retained
+  design assumption already recorded above; the release floor bounds it.
+- **27491bae6b86 (hook exemption keyed to `tx.origin`, low)**: `InkHook` is not deployed by this
+  launch. Its comment now states the converse (a transaction an agent-holder EOA sends for others
+  is exempt as a whole) next to the existing smart-wallet note; no logic changed.
+- **c6e22ac0d422 (`pull()` has no fee bound, info)**: the expiry fee is bounded by
+  `MAX_FEE_BPS`, is only paid if nobody reveals within 256 blocks (the puller can always reveal),
+  and the owner is trusted for fee changes; `pull(uint256)`'s signature is left as the project's
+  tests and scripts use it.
+- **8c199ec1fbb9 (INK above outstanding backing is stranded, info)**: every path moves exact
+  portrait multiples by design; forwarding a surplus would add a payout path the brief did not ask
+  for. Documented: send exactly the allocation.
+- **e507b4d5ebe7 (hook fee rounds to zero below 100 wei, info)**: not deployed here; a fee-free
+  band of 1e-16 of a token per swap, no change.
+
 ## Other changed files and reasons
 
 - `test/MainnetContractsLaunch.t.sol`: rehearses exactly the four requested deployments in
@@ -157,7 +252,9 @@ and no time fallback if the owner never completes setup. These were not redesign
   request draft and explicitly leaves it to the owner, matching this assignment.
 - `README.md`, `SETUP.md`, `launch/README.md`: record the current scope, correct owner/treasury
   distinction, configuration order, expiry semantics and validation entry point.
-- `script/InkSteps.sol`: corrects only the treasury comment; it does not change script logic.
+- `script/InkSteps.sol`: corrects only the treasury and premium-order comments; it does not change
+  script logic.
+- `test/RangeMath.t.sol`: range-arithmetic harness for the width clamp (revision).
 - `ADAPTATION.md`: this change log and deployment handoff.
 
 The existing build configuration, dependencies, artwork, hook and fee-router logic remain
@@ -175,16 +272,18 @@ audit proofs then produced **4 expected failures**; six additional exploit asser
 against unchanged source passed. Those temporary reproductions were confined to scratch
 and are not part of the deliverable.
 
-The new factory rehearsal reports runtimes of **8,920 / 12,063 / 11,898 / 12,804 bytes**,
-in deployment order, each below EIP-170. All init codes including arguments fit EIP-3860.
+After the revision, `forge build --sizes` reports runtimes of **9,307 / 12,400 / 12,437 / 12,991
+bytes** (InkPortraits, InkVault, InkLiquidity, InkRenderer), each below EIP-170. All init codes
+including arguments fit EIP-3860.
 No bytecode contains an external library link; the deployed runtime scan passes for
 DELEGATECALL, CALLCODE and SELFDESTRUCT exclusions.
 
 Final `forge build` passed, including a clean rebuild during validation. Compiler warnings
 are the existing uint128 shift in the liquidity ladder and shadowed names in `LocalStack.s.sol`.
 
-The final full seeded `forge test -vv` run passed: **96 passed, 0 failed, 28 skipped** across
-17 suites. Fuzz tests ran 256 cases each; the original seven vault invariants passed at
+The final full seeded `forge test` run after the revision passed: **107 passed, 0 failed,
+28 skipped** across 19 suites (plus the reviewer's proof and the remaining audit setter proof,
+run from scratch: both pass). Fuzz tests ran 256 cases each; the original seven vault invariants passed at
 64 runs × 120 calls with zero handler reverts. Skips are the existing optional fork/snapshot
 tests; no new regression or factory test skips. The default suite remains network-independent.
 

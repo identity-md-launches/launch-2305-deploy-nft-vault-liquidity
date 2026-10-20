@@ -5,13 +5,41 @@ import {Test} from "forge-std/Test.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {InkPortraits} from "../src/InkPortraits.sol";
 import {InkVault} from "../src/InkVault.sol";
 import {InkRenderer} from "../src/InkRenderer.sol";
 import {TestSeats} from "../src/testnet/TestSeats.sol";
 import {ConfiguredLiquidity} from "./helpers/ConfiguredLiquidity.sol";
 
-/// Regressions for imported findings 7a54cd1bfe87, 8ff058a5ba34 and f6efe85d4b38.
+/// Review finding 16c7464acc9e: a contract that parks one agent portrait and hands in anyone's swarm
+/// portrait at the holder rate, forwarding the INK in the same transaction.
+contract DiscountProxy {
+    InkVault immutable vault;
+    InkPortraits immutable portraits;
+
+    constructor(InkVault v) {
+        vault = v;
+        portraits = v.portraits();
+        portraits.setApprovalForAll(address(v), true);
+    }
+
+    function depositFor(uint256 tokenId) external returns (uint256 out) {
+        portraits.transferFrom(msg.sender, address(this), tokenId);
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = tokenId;
+        out = vault.deposit(ids, 0);
+        vault.ink().transfer(msg.sender, out);
+    }
+
+    function rerollFor(uint256 tokenId) external returns (uint256 fee) {
+        vault.ink().approve(address(vault), type(uint256).max);
+        fee = vault.rerollTraits(tokenId, type(uint256).max);
+    }
+}
+
+/// Regressions for imported findings 7a54cd1bfe87, 8ff058a5ba34 and f6efe85d4b38, and review finding
+/// 16c7464acc9e (discount resold through an agent-holding contract) and 68252bb4caa5 (two-step ownership).
 contract LaunchSafetyTest is Test {
     uint256 constant P = 400_000e18;
     address owner = makeAddr("owner");
@@ -298,6 +326,126 @@ contract LaunchSafetyTest is Test {
         fresh.setup(keccak256("root"), uint64(block.timestamp), address(sink));
         vm.stopPrank();
         assertEq(fresh.liquidity(), address(sink));
+    }
+
+    function _deposit(address who, uint256 tokenId) internal returns (uint256 fee) {
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = tokenId;
+        uint256 before = ink.balanceOf(address(sink));
+        vm.startPrank(who);
+        portraits.setApprovalForAll(address(vault), true);
+        vault.deposit(ids, 0);
+        vm.stopPrank();
+        fee = ink.balanceOf(address(sink)) - before;
+    }
+
+    // ---------------------------------------------------------------- 16c7464acc9e: discount follows the portrait
+
+    function test_nonHolderPaysFullFeeThroughAgentHoldingContract() public {
+        uint256 tokenId = _swarm(alice);
+        DiscountProxy proxy = new DiscountProxy(vault);
+        vm.prank(agent);
+        portraits.transferFrom(agent, address(proxy), 0);
+        vm.roll(block.number + 1);
+        assertTrue(portraits.isAgentHolder(address(proxy)), "the proxy is an agent holder in its own right");
+        assertFalse(portraits.isAgentHolder(alice));
+        assertFalse(
+            portraits.hasRerollDiscount(address(proxy), tokenId), "but not on a portrait handed to it"
+        );
+
+        uint256 before = ink.balanceOf(address(sink));
+        vm.startPrank(alice);
+        portraits.approve(address(proxy), tokenId);
+        uint256 out = proxy.depositFor(tokenId);
+        vm.stopPrank();
+        assertEq(ink.balanceOf(address(sink)) - before, P * vault.rerollFeeBps() / 10_000, "full fee");
+        assertEq(out, P - P * vault.rerollFeeBps() / 10_000);
+        assertEq(ink.balanceOf(alice), out);
+    }
+
+    function test_traitRerollThroughAgentHoldingContractPaysFullFee() public {
+        uint256 tokenId = _swarm(alice);
+        DiscountProxy proxy = new DiscountProxy(vault);
+        vm.prank(agent);
+        portraits.transferFrom(agent, address(proxy), 0);
+        vm.prank(alice);
+        portraits.transferFrom(alice, address(proxy), tokenId);
+        vm.roll(block.number + 1);
+        ink.mint(address(proxy), P / 100);
+        assertEq(proxy.rerollFor(tokenId), P * vault.rerollFeeBps() / 10_000, "holder rate is not delegable");
+    }
+
+    function test_agentHolderDiscountOnlyOnOwnPullsStillHeld() public {
+        uint256 pulled = _swarm(agent);
+        assertTrue(portraits.heldFromVault(pulled));
+        assertTrue(portraits.hasRerollDiscount(agent, pulled));
+        ink.mint(agent, P / 200);
+        vm.startPrank(agent);
+        ink.approve(address(vault), type(uint256).max);
+        assertEq(
+            vault.rerollTraits(pulled, P / 200), P * vault.agentRerollFeeBps() / 10_000, "own pull: half"
+        );
+        vm.stopPrank();
+        _mature();
+        assertTrue(vault.revealTraits(pulled));
+        assertTrue(portraits.heldFromVault(pulled), "a repaint is not a transfer");
+
+        // A portrait bought or received from anyone else pays the full fee, even for an agent holder.
+        uint256 bought = _swarm(alice);
+        vm.prank(alice);
+        portraits.transferFrom(alice, agent, bought);
+        vm.roll(block.number + 1);
+        assertFalse(portraits.heldFromVault(bought));
+        assertFalse(portraits.hasRerollDiscount(agent, bought));
+        assertEq(_deposit(agent, bought), P * vault.rerollFeeBps() / 10_000, "received portrait: full fee");
+        assertEq(_deposit(agent, pulled), P * vault.agentRerollFeeBps() / 10_000, "own pull: half");
+
+        // Moving your own pull away and back loses the discount too.
+        uint256 moved = _swarm(agent);
+        vm.prank(agent);
+        portraits.transferFrom(agent, alice, moved);
+        vm.prank(alice);
+        portraits.transferFrom(alice, agent, moved);
+        assertFalse(portraits.heldFromVault(moved));
+        assertEq(_deposit(agent, moved), P * vault.rerollFeeBps() / 10_000);
+
+        // Non-holders pay the full fee on their own pulls, as before.
+        uint256 own = _swarm(alice);
+        assertTrue(portraits.heldFromVault(own));
+        assertFalse(portraits.hasRerollDiscount(alice, own));
+        assertEq(_deposit(alice, own), P * vault.rerollFeeBps() / 10_000);
+    }
+
+    // ---------------------------------------------------------------- 68252bb4caa5: ownership moves in two steps
+
+    function test_ownershipTransferRequiresAcceptance() public {
+        InkRenderer renderer = new InkRenderer(portraits, owner);
+        address wrong = makeAddr("wrong");
+        address next = makeAddr("next");
+        Ownable2Step[3] memory owned = [Ownable2Step(portraits), Ownable2Step(vault), Ownable2Step(renderer)];
+        for (uint256 i; i < owned.length; i++) {
+            // A transfer to an address nobody controls changes nothing until it is accepted.
+            vm.prank(owner);
+            owned[i].transferOwnership(wrong);
+            assertEq(owned[i].owner(), owner);
+            assertEq(owned[i].pendingOwner(), wrong);
+            vm.prank(next);
+            vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, next));
+            owned[i].acceptOwnership();
+            // The owner can still correct it.
+            vm.prank(owner);
+            owned[i].transferOwnership(next);
+            vm.prank(next);
+            owned[i].acceptOwnership();
+            assertEq(owned[i].owner(), next);
+            assertEq(owned[i].pendingOwner(), address(0));
+            vm.prank(owner);
+            vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, owner));
+            owned[i].transferOwnership(owner);
+        }
+        vm.prank(next);
+        vault.setFees(200, 100);
+        assertEq(vault.rerollFeeBps(), 200);
     }
 
     function test_cannotRenounceBeforeRequiredConfiguration() public {

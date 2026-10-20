@@ -33,7 +33,9 @@ interface IInkVault {
 ///   liquidity contract, which adds it back to the pool as permanent liquidity.
 /// Nothing can be changed after deployment; the hook has no owner.
 /// @dev The swapper is tx.origin, because routers sit between the wallet and the pool. Smart-contract
-/// wallets therefore don't get the discount. The discount needs the agent portrait to have been
+/// wallets therefore don't get the discount, and conversely every swap in a transaction an agent-holder
+/// EOA sends for others (a bundler, relayer or searcher) is exempt: the exemption follows the transaction
+/// sender, not the party whose order is filled. The discount needs the agent portrait to have been
 /// held since an earlier block, so it can't be borrowed for a single swap.
 contract InkHook is IHooks, IUnlockCallback {
     using CurrencyLibrary for Currency;

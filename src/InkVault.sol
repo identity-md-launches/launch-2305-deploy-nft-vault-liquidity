@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -29,14 +30,16 @@ interface IInkLiquidity {
 ///   block after the pull, so it can't be known (or retried) when the INK is spent. Anyone can reveal it.
 ///   Pulls are revealed strictly in order, and a portrait handed in only joins the draw for pulls made in
 ///   later blocks, so once a block hash is public nobody can change what it picks.
-/// - Reroll: hand a swarm portrait back for 400,000 INK minus a fee. Holders of an agent portrait pay half.
+/// - Reroll: hand a swarm portrait back for 400,000 INK minus a fee. Holders of an agent portrait pay half on
+///   the portraits they pulled and still hold (not on ones bought or handed to them, so the discount can't be
+///   resold through a contract that holds one agent portrait).
 /// - Trait reroll: pay the same fee to give a swarm portrait you hold a new random seed, drawn from the hash
 ///   of the block after the request like a pull. Same token, new art and traits.
 /// - Agent deposit: hand an agent portrait in for exactly 400,000 INK. It joins the draw, so any pull can
 ///   land a one-of-a-kind agent portrait.
 /// Every fee goes to the liquidity contract, which adds it back to the pool; nothing is burned.
 /// Every portrait outside the vault is backed by 400,000 INK inside it.
-contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
+contract InkVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     using SafeERC20 for IERC20;
 
     uint256 public constant PORTRAIT = 400_000e18;
@@ -372,8 +375,10 @@ contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
     // ---------------------------------------------------------------- deposits: rerolls and agent portraits
 
     /// @notice Hands portraits to the vault, where pulls made from the next block on can land them.
-    /// - A swarm portrait returns 400,000 INK minus the reroll fee (lower for agent-portrait holders), which
-    ///   goes to the liquidity contract.
+    /// - A swarm portrait returns 400,000 INK minus the reroll fee, which goes to the liquidity contract.
+    ///   An agent-portrait holder pays the lower fee on portraits the vault handed to it (its own pulls) that
+    ///   it has not moved since; one received from anyone else pays the full fee, so the discount can't be
+    ///   resold through a contract that parks an agent portrait.
     /// - An agent portrait returns exactly 400,000 INK.
     /// @param minOut Reverts if the INK paid out would be less (fees can change between signing and mining).
     function deposit(uint256[] calldata tokenIds, uint256 minOut)
@@ -393,12 +398,14 @@ contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
         for (uint256 i; i < tokenIds.length; i++) {
             uint256 tokenId = tokenIds[i];
             if (traitRerollBlock[tokenId] != 0) revert RerollPending();
+            // Read before the transfer, which the vault makes and so would mark the portrait as its own.
+            bool discounted = agentHolder && portraits.heldFromVault(tokenId);
             portraits.transferFrom(msg.sender, address(this), tokenId);
             _incoming.push(Incoming({tokenId: tokenId, blockNumber: uint64(block.number)}));
 
             uint256 fee = portraits.isAgentPortrait(tokenId)
                 ? 0
-                : (PORTRAIT * (agentHolder ? agentRerollFeeBps : rerollFeeBps)) / 10_000;
+                : (PORTRAIT * (discounted ? agentRerollFeeBps : rerollFeeBps)) / 10_000;
             fees += fee;
             inkOut += PORTRAIT - fee;
             emit Deposited(msg.sender, tokenId, PORTRAIT - fee, fee);
@@ -410,16 +417,20 @@ contract InkVault is Ownable, ReentrancyGuard, IERC721Receiver {
 
     // ---------------------------------------------------------------- trait rerolls
 
-    /// @notice Pays the reroll fee (lower for agent-portrait holders, sent to the liquidity contract) to repaint a swarm portrait you hold
-    /// with a new random seed. The seed comes from the hash of the next block, so it can't be known when the
-    /// fee is paid; anyone can reveal it with revealTraits(). The portrait can't be transferred or handed in meanwhile.
+    /// @notice Pays the reroll fee (sent to the liquidity contract) to repaint a swarm portrait you hold with a
+    /// new random seed. Agent-portrait holders pay the lower fee on portraits the vault handed to them that
+    /// they have not moved since (see deposit()). The seed comes from the hash of the next block, so it can't
+    /// be known when the fee is paid; anyone can reveal it with revealTraits(). The portrait can't be
+    /// transferred or handed in meanwhile.
     /// @param maxFee Reverts if the fee would be more (fees can change between signing and mining).
     function rerollTraits(uint256 tokenId, uint256 maxFee) external nonReentrant returns (uint256 fee) {
         if (!released) revert NotReleased();
         if (portraits.isAgentPortrait(tokenId)) revert AgentPortrait();
         if (portraits.ownerOf(tokenId) != msg.sender) revert NotYourPortrait();
         if (traitRerollBlock[tokenId] != 0) revert RerollPending();
-        fee = (PORTRAIT * (portraits.isAgentHolder(msg.sender) ? agentRerollFeeBps : rerollFeeBps)) / 10_000;
+        fee =
+            (PORTRAIT * (portraits.hasRerollDiscount(msg.sender, tokenId) ? agentRerollFeeBps : rerollFeeBps))
+                / 10_000;
         if (fee > maxFee) revert FeeTooHigh();
         traitRerollBlock[tokenId] = uint64(block.number);
         ink.safeTransferFrom(msg.sender, liquidity, fee);
